@@ -23,7 +23,6 @@ mod wallet;
 
 use crate::chain::{keccak_host, verify_hit, ReadClient};
 use crate::config::Config;
-use crate::cuda::{list_devices, nonce_from_counter, CudaContext};
 use crate::metrics::Metrics;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
@@ -31,6 +30,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+#[cfg(feature = "cuda")]
+use crate::cuda::{list_devices, nonce_from_counter, CudaContext};
 
 #[derive(Parser, Debug)]
 #[command(name = "hash-miner", about = "CUDA + Rust miner for the $HASH protocol")]
@@ -64,9 +66,6 @@ enum Cmd {
         #[arg(long)]
         difficulty_hex: Option<String>,
 
-        /* Optional manual override for kernel launch shape. Useful for
-         * sweeping the (blocks, tpb) grid to find the throughput peak on
-         * a given GPU without recompiling. */
         #[arg(long)]
         blocks: Option<i32>,
 
@@ -87,10 +86,6 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum WalletCmd {
-    /* Generate a fresh address + private key. The key is printed to
-     * stdout only - the miner reads its key from an environment
-     * variable, so put the printed key in your shell rc, systemd unit,
-     * or a secrets manager. There is no on-disk wallet file. */
     New,
 }
 
@@ -121,6 +116,7 @@ async fn main() -> Result<()> {
     }
 }
 
+#[cfg(feature = "cuda")]
 fn cmd_devices() -> Result<()> {
     let devs = list_devices().map_err(|e| anyhow!(e))?;
     if devs.is_empty() {
@@ -145,6 +141,14 @@ fn cmd_devices() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "cuda"))]
+fn cmd_devices() -> Result<()> {
+    println!("compiled without CUDA support — no GPU devices available");
+    println!("rebuild with: cargo build --release  (requires nvcc)");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn cmd_selftest(device: usize) -> Result<()> {
     let mut ctx = CudaContext::new(device).map_err(|e| anyhow!(e))?;
     let info = ctx.info();
@@ -154,7 +158,6 @@ fn cmd_selftest(device: usize) -> Result<()> {
         "selftest"
     );
 
-    /* Vector 1: all-zero input - well-known keccak. */
     let zero_in = [0u8; 64];
     let zero_out = keccak_host(&zero_in);
     let kernel_out = ctx.self_test(&zero_in).map_err(|e| anyhow!("self_test: {e}"))?;
@@ -168,7 +171,6 @@ fn cmd_selftest(device: usize) -> Result<()> {
     }
     info!(hash = %hex::encode(zero_out), "zero-input ok");
 
-    /* Vector 2: arbitrary input. */
     let mut buf = [0u8; 64];
     for i in 0..64 { buf[i] = i as u8; }
     let host = keccak_host(&buf);
@@ -183,9 +185,6 @@ fn cmd_selftest(device: usize) -> Result<()> {
     }
     info!(hash = %hex::encode(host), "sequence input ok");
 
-    /* Vector 3: mining-shape input via mine_kernel by setting difficulty
-       to max (every hash wins). Verify the kernel's hit hash matches the
-       host's keccak for the same (challenge, prefix, counter). */
     let challenge = [
         0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
         0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
@@ -228,7 +227,6 @@ fn cmd_selftest(device: usize) -> Result<()> {
         "mine-kernel hit ok"
     );
 
-    /* Verify it passes the host's verify_hit function. */
     let _h = verify_hit(&challenge, &nonce, alloy::primitives::U256::MAX)
         .map_err(|e| anyhow!("host verify_hit failed: {e}"))?;
     info!("verify_hit ok");
@@ -237,6 +235,13 @@ fn cmd_selftest(device: usize) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "cuda"))]
+fn cmd_selftest(_device: usize) -> Result<()> {
+    println!("compiled without CUDA support — selftest requires a GPU");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn cmd_bench(
     seconds: u64,
     devices: Vec<usize>,
@@ -255,7 +260,6 @@ fn cmd_bench(
             a
         }
         None => {
-            /* Very small target so we essentially never hit. Roughly 2^-32. */
             let mut d = [0u8; 32];
             d[3] = 0x01;
             d
@@ -309,6 +313,20 @@ fn cmd_bench(
     Ok(())
 }
 
+#[cfg(not(feature = "cuda"))]
+fn cmd_bench(
+    _seconds: u64,
+    _devices: Vec<usize>,
+    _iters: i32,
+    _difficulty_hex: Option<String>,
+    _blocks_override: Option<i32>,
+    _tpb_override: Option<i32>,
+) -> Result<()> {
+    println!("compiled without CUDA support — bench requires a GPU");
+    println!("use `make mine` with CPU fallback for hash-rate measurement");
+    Ok(())
+}
+
 async fn cmd_mine(config_path: PathBuf) -> Result<()> {
     let cfg = Config::load(&config_path)?;
     globals::set_submit_rpcs(cfg.chain.submit_rpcs.clone());
@@ -345,16 +363,27 @@ async fn cmd_mine(config_path: PathBuf) -> Result<()> {
         cfg.submit.clone(),
     );
 
-    let devices = if cfg.mine.cuda_devices.is_empty() {
+    #[cfg(feature = "cuda")]
+    let devices: Vec<usize> = if cfg.mine.cuda_devices.is_empty() {
         let n = cuda::device_count().map_err(|e| anyhow!("device_count: {e}"))?;
         (0..n).collect()
     } else {
         cfg.mine.cuda_devices.clone()
     };
+
+    #[cfg(feature = "cuda")]
     if devices.is_empty() {
         return Err(anyhow!("no CUDA devices available"));
     }
-    info!(count = devices.len(), ids = ?devices, "gpus");
+
+    #[cfg(not(feature = "cuda"))]
+    let devices: Vec<usize> = if cfg.mine.cuda_devices.is_empty() {
+        vec![0]
+    } else {
+        cfg.mine.cuda_devices.clone()
+    };
+
+    info!(count = devices.len(), ids = ?devices, "workers");
 
     let metrics = Arc::new(Metrics::new());
     let min_balance_wei = wei_from_eth(cfg.economics.min_balance_eth);

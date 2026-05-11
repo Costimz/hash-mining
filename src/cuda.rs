@@ -3,10 +3,16 @@
  * One `CudaContext` owns the per-device CUDA state. The wrapper takes a
  * `&mut self` for every mutating call so we don't need to share contexts
  * across threads; each worker thread owns one.
+ *
+ * Everything except `nonce_from_counter` is gated behind the `cuda` feature.
+ * When compiled without CUDA, `device_count` returns 0 and all GPU types
+ * are absent so the CPU fallback path can link cleanly.
  */
 
+#[cfg(feature = "cuda")]
 use std::os::raw::{c_char, c_int, c_uchar};
 
+#[cfg(feature = "cuda")]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct MinerResult {
@@ -16,6 +22,7 @@ pub struct MinerResult {
     pub hash_be: [u64; 4],
 }
 
+#[cfg(feature = "cuda")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct MinerDeviceInfo {
@@ -29,6 +36,7 @@ pub struct MinerDeviceInfo {
     pub total_memory_bytes: u64,
 }
 
+#[cfg(feature = "cuda")]
 impl Default for MinerDeviceInfo {
     fn default() -> Self {
         Self {
@@ -44,6 +52,7 @@ impl Default for MinerDeviceInfo {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl MinerDeviceInfo {
     pub fn name_str(&self) -> String {
         let bytes: &[u8] = unsafe {
@@ -54,11 +63,13 @@ impl MinerDeviceInfo {
     }
 }
 
+#[cfg(feature = "cuda")]
 #[repr(C)]
 struct OpaqueCtx {
     _private: [u8; 0],
 }
 
+#[cfg(feature = "cuda")]
 extern "C" {
     fn miner_device_count() -> c_int;
     fn miner_device_info(device_id: c_int, out: *mut MinerDeviceInfo) -> c_int;
@@ -92,28 +103,37 @@ extern "C" {
     ) -> c_int;
 }
 
+#[cfg(feature = "cuda")]
 pub fn device_count() -> Result<usize, i32> {
     let n = unsafe { miner_device_count() };
     if n < 0 { Err(n) } else { Ok(n as usize) }
 }
 
+#[cfg(not(feature = "cuda"))]
+pub fn device_count() -> Result<usize, i32> { Ok(0) }
+
+#[cfg(feature = "cuda")]
 pub fn device_info(device_id: usize) -> Result<MinerDeviceInfo, i32> {
     let mut info = MinerDeviceInfo::default();
     let r = unsafe { miner_device_info(device_id as c_int, &mut info) };
     if r != 0 { Err(r) } else { Ok(info) }
 }
 
+#[cfg(feature = "cuda")]
 pub struct CudaContext {
     ptr: *mut OpaqueCtx,
     device_id: usize,
     info: MinerDeviceInfo,
 }
 
+#[cfg(feature = "cuda")]
 unsafe impl Send for CudaContext {}
 
+#[cfg(feature = "cuda")]
 impl CudaContext {
     pub fn new(device_id: usize) -> Result<Self, String> {
-        let info = device_info(device_id).map_err(|e| format!("cudaGetDeviceProperties failed: {e}"))?;
+        let info = device_info(device_id)
+            .map_err(|e| format!("cudaGetDeviceProperties failed: {e}"))?;
         let ptr = unsafe { miner_create(device_id as c_int) };
         if ptr.is_null() {
             return Err(format!("miner_create({device_id}) returned NULL"));
@@ -131,7 +151,12 @@ impl CudaContext {
         nonce_prefix: &[u8; 24],
     ) -> Result<(), i32> {
         let r = unsafe {
-            miner_set_job(self.ptr, challenge.as_ptr(), difficulty.as_ptr(), nonce_prefix.as_ptr())
+            miner_set_job(
+                self.ptr,
+                challenge.as_ptr(),
+                difficulty.as_ptr(),
+                nonce_prefix.as_ptr(),
+            )
         };
         if r != 0 { Err(r) } else { Ok(()) }
     }
@@ -176,6 +201,7 @@ impl CudaContext {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl Drop for CudaContext {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -185,6 +211,7 @@ impl Drop for CudaContext {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub fn list_devices() -> Result<Vec<MinerDeviceInfo>, String> {
     let n = device_count().map_err(|e| format!("device_count failed: {e}"))?;
     let mut v = Vec::with_capacity(n);
@@ -194,13 +221,9 @@ pub fn list_devices() -> Result<Vec<MinerDeviceInfo>, String> {
     Ok(v)
 }
 
-/* Tracks counters and reconstructs the full 32-byte big-endian nonce
- * from a (prefix, counter) pair. The prefix is fixed per-launch; the
- * counter is what the kernel writes back. */
 pub fn nonce_from_counter(prefix: &[u8; 24], counter: u64) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[..24].copy_from_slice(prefix);
     out[24..].copy_from_slice(&counter.to_be_bytes());
     out
 }
-

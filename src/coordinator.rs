@@ -1,14 +1,13 @@
 /*!
- * coordinator.rs: top-level mining loop. Owns one `CudaContext` per
- * device, the read client, the submitter, and the metrics. Watches for
- * epoch rotations and re-targets workers when the challenge changes.
+ * coordinator.rs: top-level mining loop. Owns one worker context per
+ * device (CUDA or CPU), the read client, the submitter, and the metrics.
+ * Watches for epoch rotations and re-targets workers when the challenge changes.
  *
  * Each device runs in its own tokio blocking task; coordination is via
  * a tokio mpsc channel for hits and a tokio watch for the current job.
  */
 
 use crate::chain::{verify_hit, ReadClient};
-use crate::cuda::{nonce_from_counter, CudaContext};
 use crate::metrics::Metrics;
 use crate::submit::{SubmitOutcome, Submitter};
 use crate::types::{Hit, Job, SharedStop, StopFlag};
@@ -18,6 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
+
+#[cfg(feature = "cuda")]
+use crate::cuda::{nonce_from_counter, CudaContext};
 
 pub struct Coordinator {
     pub read: Arc<ReadClient>,
@@ -152,6 +154,7 @@ impl Coordinator {
     }
 }
 
+#[cfg(feature = "cuda")]
 fn run_device(
     device_id: usize,
     job_rx: watch::Receiver<Job>,
@@ -232,6 +235,80 @@ fn run_device(
     }
 }
 
+#[cfg(not(feature = "cuda"))]
+fn run_device(
+    device_id: usize,
+    job_rx: watch::Receiver<Job>,
+    hit_tx: mpsc::Sender<Hit>,
+    stop: SharedStop,
+    metrics: Arc<Metrics>,
+    _batch_iters: i32,
+) -> Result<()> {
+    use crate::cpu;
+    use crate::cuda::nonce_from_counter;
+    use crate::types::{Counter, SharedCounter};
+
+    let n_threads = num_cpus::get();
+    metrics.register_device(device_id, format!("CPU-{device_id}"));
+    info!(device_id, threads = n_threads, "cpu worker online");
+
+    let mut prefix = [0u8; 24];
+    {
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut prefix);
+        prefix[0] = device_id as u8;
+    }
+
+    let batch: u64 = 1 << 20;
+    let mut base_counter: u64 = 0u64;
+    let mut job_rx = job_rx;
+    let mut cur_job = job_rx.borrow().clone();
+
+    loop {
+        if job_rx.has_changed().unwrap_or(false) {
+            cur_job = job_rx.borrow_and_update().clone();
+            base_counter = 0;
+            stop.clear();
+        }
+        if stop.is_set() {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+
+        let progress: SharedCounter = Arc::new(Counter::default());
+        let hit = cpu::run_pool(
+            n_threads,
+            cur_job.challenge,
+            prefix,
+            cur_job.difficulty,
+            base_counter,
+            batch,
+            Arc::clone(&stop),
+            Arc::clone(&progress),
+        );
+
+        let attempted = progress.get();
+        metrics.bump_hashes(attempted);
+        metrics.bump_device_hashes(device_id, attempted);
+        base_counter = base_counter.wrapping_add(batch);
+
+        if let Some(cpu_hit) = hit {
+            let nonce = nonce_from_counter(&prefix, cpu_hit.counter);
+            let send = Hit {
+                nonce,
+                hash: cpu_hit.hash_be,
+                epoch: cur_job.epoch,
+                miner: cur_job.miner,
+            };
+            if hit_tx.blocking_send(send).is_err() {
+                error!("coordinator hit channel closed");
+                return Ok(());
+            }
+            stop.set();
+        }
+    }
+}
+
 async fn epoch_watcher(read: Arc<ReadClient>, job_tx: watch::Sender<Job>) {
     let mut tick = tokio::time::interval(Duration::from_millis(2_000));
     let mut cur = job_tx.borrow().clone();
@@ -280,13 +357,13 @@ async fn tick_logger(metrics: Arc<Metrics>) {
     loop {
         tick.tick().await;
         let s = metrics.snapshot();
-        let per_gpu = s.devices.iter()
-            .map(|d| format!("gpu{}={}", d.device_id, crate::metrics::fmt_rate(d.rate).trim()))
+        let per_device = s.devices.iter()
+            .map(|d| format!("dev{}={}", d.device_id, crate::metrics::fmt_rate(d.rate).trim()))
             .collect::<Vec<_>>()
             .join(" ");
         let line = format!(
             "{} | total {} | avg {} | up {} | hits {} | mints {}",
-            per_gpu,
+            per_device,
             crate::metrics::fmt_rate(s.total_rate).trim(),
             crate::metrics::fmt_rate(s.avg_rate).trim(),
             crate::metrics::fmt_uptime(s.elapsed),
@@ -300,4 +377,3 @@ async fn tick_logger(metrics: Arc<Metrics>) {
 fn format_gwei(wei: u128) -> String {
     format!("{:.2}", wei as f64 / 1e9)
 }
-
