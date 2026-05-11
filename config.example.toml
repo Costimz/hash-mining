@@ -1,0 +1,34 @@
+[chain]
+read_rpc    = "wss://eth-mainnet.alchemyapi.io/v2/<YOUR_KEY>"
+submit_rpcs = [
+    "https://rpc.mevblocker.io/fast",
+    "https://rpc.flashbots.net/fast",
+]
+chain_id = 1
+contract = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc"
+
+[wallet]
+# Name of the env var that holds the hex-encoded private key.
+# Export it before starting the miner: `export MINER1_PRIVKEY=0x...`
+private_key_env = "MINER1_PRIVKEY"
+
+[mine]
+backend          = "cuda"
+cuda_devices     = []         # empty = all visible
+batch_size       = 64         # iters per kernel launch (per thread)
+poll_interval_ms = 2000
+event_subscribe  = true
+
+[submit]
+priority_tip_gwei         = 6.0
+max_priority_tip_gwei     = 25.0
+base_fee_multiplier       = 3
+gas_min                   = 200000
+gas_max                   = 400000
+gas_estimate_timeout_ms   = 4000
+submit_timeout_ms         = 12000
+
+[economics]
+min_hash_price_usd       = 0.0
+gas_budget_per_hour_usd  = 0.0
+min_balance_eth          = 0.05
